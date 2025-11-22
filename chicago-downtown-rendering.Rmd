@@ -1,0 +1,300 @@
+---
+title: "chicago-downtown-rendering"
+author: "Kabir Jain"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: show
+---
+
+<body style="background-color:#fbf4ea;">
+
+# 3d renderings for downtown Chicago
+
+I've been wanting to delve deeper into visualizations, and something that has 
+interested me for a while is the universe of 3d visualizations. So, I decided to 
+learn how to render physical objects in a 3-dimensional space, and of course I 
+chose my favorite language, R, to do it in. And of course I chose my favorite 
+city, Chicago, to do it for.
+
+I created a visualization of the buildings in downtown Chicago. Before 
+getting into the code, here is what the finished product looks like:
+
+![](data/movieExport-cropped.gif)
+
+## the prerequisites 
+The first order of business is to define your location using what is known as a 
+'bounding box'. A bounding box is simply the minimum and maximum XY coordinates 
+that define the 'rectangle' within which you will be working.
+
+[This website](http://bboxfinder.com/) is what I used to initially define my 
+bounding box. It prints out the resulting coordinates, which can be pasted into 
+the code.
+
+The second order of business is actually getting the buildings data. In this 
+example, I'm using [Open Street Map](https://overpass-turbo.eu/s/1VX3) data.
+To get this data, you need to:
+
+1. Define your bounding box (again)
+
+2. Write a query to get the data you need
+
+For my project, I simply drew a bounding box slightly bigger than the one I 
+defined on the previous website. The query you can use is:
+
+```{r, eval=F}
+[out:json][timeout:30];(
+way["building"]({{bbox}});
+way["building:part"]({{bbox}});
+relation["building"]["type"="multipolygon"]({{bbox}});
+);out;>;out qt;
+```
+
+I exported the features as a GEOJSON, which is what I will use in the 
+implementation.
+
+While the `osmdata` package allows for getting OSM data directly in R, I was 
+having issues with the results for buildings. In some cases, it would only return 
+the outlines of the buildings without returning the parts of the buildings. Some 
+buildings in downtown Chicago, such as the Sears Tower, are broken up into 
+several parts with differing heights. So, I resorted to a manual export using the 
+query shown above.
+
+## implementation
+
+### load required libraries
+
+```{r, eval = F}
+library(sf)
+library(dplyr)
+library(rayshader)
+library(raster)
+library(ggmap)
+library(osmdata)
+library(elevatr)
+library(gifski)
+library(raybevel)
+```
+
+### define bounding box, clean osm data
+
+```{r, eval = F}
+## coords from bboxfinder.com
+loc_bbox_coords <- c(-87.639484,41.867260,-87.611160,41.889308)
+names(loc_bbox_coords) = c("xmin","ymin","xmax","ymax")
+## also make sf object for intersecting with osm buildings data later
+loc_bbox_sf = st_as_sf(st_as_sfc(st_bbox(loc_bbox_coords)), crs=4326)
+
+## read osm features
+osmFeatures <- st_read("data/osm-export-v1.geojson")
+
+## get buildings/building parts
+osmBuildings <- osmFeatures %>%
+  filter(!is.na(`building`) | `building.part` == "yes") %>%
+  dplyr::select(id,
+                `height`,
+                `building.levels`,
+                `geometry`) %>%
+  mutate(`height` = as.numeric(gsub("[^0-9.-]", "", `height`)),
+         `building.levels` = as.numeric(gsub("[^0-9.-]", "", `building.levels`))
+  )
+
+## clean up height data
+osmBuildings <- osmBuildings %>%
+  mutate(
+    newHeight = ifelse(is.na(`height`),
+                       ifelse(is.na(`building.levels`),
+                              NA,
+                              4*`building.levels`),
+                       `height`)
+  ) %>%
+  mutate(
+    `height` = newHeight
+  ) %>%
+  filter(st_is_valid(geometry))
+
+## Intersect with bbox, remove clipped buildings
+sf_use_s2(F)
+osmBuildings <- osmBuildings %>% mutate(
+  oldArea = st_area(.)
+) %>%
+  st_intersection(loc_bbox_sf)
+osmBuildings <- osmBuildings %>%
+  mutate(
+    newArea = st_area(.)
+  ) %>%
+  filter(!(newArea < oldArea))
+sf_use_s2(T)
+```
+
+Couple things to note here:
+
+* The OSM features exported earlier contain more than just buildings. We're 
+only concerned with buildings (and building parts) so I extract those from the 
+overall featureset.
+
+* OSM height data isn't perfect; many buildings are missing height data. Some 
+buildings don't have height data, but have 'building.levels' data, which specifies 
+the number of stories. In these cases, I approximated height by assigning a height 
+of 4 meters for every story a building had (if height data wasn't available).
+
+### grabbing additional data
+```{r, eval = F}
+## get osm roads
+osmRoads <- opq(loc_bbox_coords) %>%
+  add_osm_feature(key = "highway") %>%
+  osmdata_sf()
+```
+Here, I grab some additional data from the OSM server to be able to map roads.
+
+### preparing for 3d mapping
+```{r, eval = F}
+## grap elevation raster
+osm_dem = elevatr::get_elev_raster(loc_bbox_sf, z = 12, clip = "bbox")
+e = extent(loc_bbox_sf)
+
+new_e <- osm_dem %>% crop(e) %>% extent()
+
+## convert elevation raster to matrix for 3d plotting
+osm_mat <- osm_dem %>% 
+  crop(e) %>%
+  raster_to_matrix()
+```
+
+* Here, I referenced work from the creator of the `rayshader` package, [Tyler 
+Morgan-Wall](https://www.tylermw.com/posts/rayverse/raybevel-introduction.html). 
+
+* The object `osm_dem` can be plotted using `plot(osm_dem)` to get a visual 
+reference for elevation values in your bounding box.
+
+### create base layer
+```{r, eval = F}
+osm_mat %>%
+  sphere_shade() %>%
+  add_overlay(generate_polygon_overlay(osmBuildings, extent = new_e,
+                                       heightmap = osm_mat,
+                                       linewidth = 6,
+                                       resolution_multiply = 50), rescale_original = TRUE) %>%
+  add_overlay(generate_line_overlay(osmRoads$osm_lines, extent = new_e,
+                                    heightmap = osm_mat, 
+                                    color = "grey",
+                                    linewidth = 15,
+                                    resolution_multiply = 50), rescale_original = TRUE) %>%
+  plot_3d(osm_mat, water = TRUE, windowsize = 800, watercolor = "dodgerblue", waterdepth = 176.5,
+          zscale = 10,
+          background = "#fbf4ea")
+```
+
+* This should open up an additional window that has a 3d elevation layer with 
+2d polygons and roads. This is the layer on top of which the buildings will be 
+rendered. **Don't close this window!**
+
+* Since we're mapping Lake Michigan as water, we need to define the `waterdepth`, 
+that is, the height (with respect to sea-level), at which we want the water to 
+start. Since Lake Michigan is technically at 176 meters (avg) above sea-level, I 
+set `waterdepth = 176.5`. It took a few tries to get the value right, and the 
+guesses were informed by a visual inspection of the plot returned by `plot(osm_dem)`.
+
+### coloring buildings
+```{r, eval = F}
+## create id row for buildings
+osmBuildings <- osmBuildings %>%
+  mutate(id = seq(1:nrow(osmBuildings)))
+
+## define color palette
+color.codes <- c("#f55d3e",
+                 "#878e88",
+                 "#f7cb15",
+                 "#ffffff",
+                 "#76bed0")
+
+## sample the dataset several times and assign a color group
+sample.size <- round(nrow(osmBuildings) / length(color.codes))
+
+osmBuildings$buildingColor <- ""
+
+for (i in 1:(length(color.codes) - 1)) {
+  id.sample <- sample(
+    osmBuildings[which(osmBuildings$buildingColor == ""),]$id,
+    sample.size,
+    replace = F
+  )
+  osmBuildings <- osmBuildings %>%
+    mutate(
+      buildingColor = ifelse(id %in% id.sample,
+                             i,
+                             buildingColor)
+    )
+}
+
+osmBuildings <- osmBuildings %>% 
+  mutate(
+    buildingColor = ifelse(buildingColor == "",
+                           length(color.codes),
+                           buildingColor)
+  )
+```
+
+* This step can be skipped if you don't care about colors on your buildings. 
+
+### render_buildings()
+```{r, eval = F}
+## clear any previous renderings (for iterative processes)
+render_buildings(clear_previous = T)
+
+## render buildings from each color group
+for (i in 1:length(color.codes)) {
+  render_buildings(
+    osmBuildings[which(osmBuildings$buildingColor == i),],  
+    flat_shading  = TRUE, 
+    angle = 30, 
+    heightmap = osm_mat,
+    base_height = osmBuildings[which(osmBuildings$buildingColor == i),]$newHeight,
+    material = color.codes[i], 
+    roof_material = "white",
+    extent = new_e, 
+    roof_height = 3,
+    zscale=10,
+    alpha = 0.5
+  )
+}
+```
+
+* This will add the buildings to the rendered layers in the additional window.
+
+* Mess with the arguments to the `render_buildings()` function till you're happy 
+with the output. Remember to `render_buildings(clear_previous=T)` before 
+re-rendering buildings instead of creating the whole layer again.
+
+### generating a gif
+```{r, eval = F}
+rayshader::render_movie(
+  frames = 180,
+  filename = "data/movieExport.gif"
+)
+```
+
+* This will create a .gif file panning 360 degrees around your rendered object(s).
+
+* Again, mess with arguments till you're happy with the result. I changed the 
+default frames from `360` to `180` for a smaller file size.
+
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+<br>
+
+
+
