@@ -2,9 +2,7 @@
 title: "chicago-downtown-rendering"
 author: "Kabir Jain"
 date: "`r Sys.Date()`"
-output: 
-  html_document:
-    code_folding: show
+output: html_document
 ---
 
 <body style="background-color:#fbf4ea;">
